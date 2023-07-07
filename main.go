@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/flatrtree/flatrtree-go"
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/rtree"
 )
 
 type hood struct {
@@ -34,7 +34,7 @@ func main() {
 
 	mark := time.Now()
 	fmt.Printf("Loading neighborhoods... ")
-	hoods, err := loadHoods()
+	hoods, rtree, err := loadHoods()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func main() {
 
 	mark = time.Now()
 	fmt.Printf("Joining neighborhoods and violations... ")
-	join(hoods, violations)
+	join(hoods, rtree, violations)
 	fmt.Printf("%.2f secs\n", time.Since(mark).Seconds())
 
 	mark = time.Now()
@@ -64,16 +64,18 @@ func main() {
 		time.Since(start).Seconds())
 }
 
-func loadHoods() (*rtree.RTree, error) {
-	hoods := new(rtree.RTree)
+func loadHoods() ([]*hood, *flatrtree.RTree, error) {
+	var hoods []*hood
+	builder := flatrtree.NewOMTBuilder()
+
 	data, err := os.ReadFile("data/Neighborhoods_Philadelphia.json")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	json := string(data)
 	g, err := geojson.Parse(json, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	g.(*geojson.FeatureCollection).ForEach(func(f geojson.Object) bool {
 		r := g.Rect()
@@ -82,11 +84,21 @@ func loadHoods() (*rtree.RTree, error) {
 			name: gjson.Get(feat.Members(), "properties.LISTNAME").String(),
 			feat: feat,
 		}
-		min, max := [2]float64{r.Min.X, r.Min.Y}, [2]float64{r.Max.X, r.Max.Y}
-		hoods.Insert(min, max, h)
+
+		ref := int64(len(hoods))
+		hoods = append(hoods, h)
+		builder.Add(ref, r.Min.X, r.Min.Y, r.Max.X, r.Max.Y)
+
 		return true
 	})
-	return hoods, nil
+
+	maxEntries := 64 // match maxEntries in tidwall/rtree
+	rtree, err := builder.Finish(maxEntries)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return hoods, rtree, nil
 }
 
 func loadViolations() ([]violation, error) {
@@ -121,7 +133,7 @@ func loadViolations() ([]violation, error) {
 
 }
 
-func join(hoods *rtree.RTree, violations []violation) {
+func join(hoods []*hood, rtree *flatrtree.RTree, violations []violation) {
 	var wg sync.WaitGroup
 	ch := make(chan int, 8192)
 	for i := 0; i < runtime.NumCPU(); i++ {
@@ -129,9 +141,9 @@ func join(hoods *rtree.RTree, violations []violation) {
 		go func() {
 			for i := range ch {
 				rpt := violations[i].point
-				hoods.Search(rpt, rpt,
-					func(_, _ [2]float64, v interface{}) bool {
-						h := v.(*hood)
+				rtree.Search(rpt[0], rpt[1], rpt[0], rpt[1],
+					func(ref int64) bool {
+						h := hoods[ref]
 						gpt := geometry.Point{X: rpt[0], Y: rpt[1]}
 						if h.feat.IntersectsPoint(gpt) {
 							violations[i].hood = h
